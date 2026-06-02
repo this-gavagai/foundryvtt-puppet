@@ -207,6 +207,12 @@ const CLIENT_TRIM = async () => {
       '--enable-unsafe-swiftshader',
       '--disable-accelerated-2d-canvas',
       '--mute-audio',
+      // Set the REAL window/screen size. With defaultViewport:null, page.setViewport
+      // doesn't change what Foundry reads (window.screen) — it stayed at headless
+      // Chrome's 800x600 default, below Foundry's 1366x768 minimum, which is the
+      // only error that correlates with the failed loads. 1366x768 = the minimum
+      // (keeps software-raster cost as low as Foundry will allow).
+      '--window-size=1366,768',
     ],
   });
 
@@ -246,11 +252,10 @@ const CLIENT_TRIM = async () => {
   });
 
   const page = await browser.newPage();
-  // Keep this small. Foundry logs a cosmetic "requires >= 1366x768" warning
-  // below that, but a smaller viewport means fewer pixels to software-raster
-  // during the unavoidable first-load canvas draw (before the trim can disable
-  // it) — which matters a lot with no GPU. Performance wins over the warning.
-  await page.setViewport({ width: 1280, height: 720 });
+  // Match the window size set via --window-size. (setViewport alone doesn't move
+  // window.screen, which is what Foundry's resolution check reads — the launch
+  // arg above is what actually satisfies it; this keeps innerWidth consistent.)
+  await page.setViewport({ width: 1366, height: 768 });
 
   // Run before any document scripts on every navigation:
   //   1. Silence console.debug so Foundry's per-hook chatter never reaches CDP.
@@ -373,7 +378,35 @@ const CLIENT_TRIM = async () => {
 
     // Confirm the game actually finished loading, not just the HTML.
     // Heavily-modded worlds on busy servers can easily take 2+ minutes.
-    await page.waitForFunction(() => globalThis.game?.ready === true, { timeout: GAME_READY_TIMEOUT });
+    // On timeout, dump the actual game state so we know WHY ready never came
+    // (game undefined? socket down? stuck mid-init?) instead of a bare
+    // "Waiting failed". Also log progress periodically while we wait.
+    let waited = 0;
+    const PROGRESS_EVERY = 30000;
+    const progress = setInterval(async () => {
+      waited += PROGRESS_EVERY;
+      const st = await page.evaluate(() => ({
+        game: typeof globalThis.game,
+        ready: globalThis.game?.ready,
+        socket: globalThis.game?.socket?.connected,
+        scene: globalThis.game?.scenes?.active?.name ?? null,
+      })).catch(e => ({ evalError: e.message }));
+      console.log(`[join-wait] +${waited / 1000}s ${JSON.stringify(st)}`);
+    }, PROGRESS_EVERY);
+    try {
+      await page.waitForFunction(() => globalThis.game?.ready === true, { timeout: GAME_READY_TIMEOUT });
+    } catch (e) {
+      const st = await page.evaluate(() => ({
+        game: typeof globalThis.game,
+        ready: globalThis.game?.ready,
+        socket: globalThis.game?.socket?.connected,
+        scene: globalThis.game?.scenes?.active?.name ?? null,
+        url: location.href,
+      })).catch(ev => ({ evalError: ev.message }));
+      throw new Error(`game-ready wait failed: ${e.message} | state=${JSON.stringify(st)}`);
+    } finally {
+      clearInterval(progress);
+    }
     gameMissingCount = 0;
     lastReadyAt = Date.now();
     console.log(`[join] ready at ${page.url()}`);
