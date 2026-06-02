@@ -174,7 +174,10 @@ const CLIENT_TRIM = async () => {
   // Notify any module listening for visibilitychange so it can pause itself.
   try { document.dispatchEvent(new Event('visibilitychange')); } catch { }
 
-  console.log(`[puppet] client trim applied; killed: ${killed.join(', ') || 'none'}`);
+  // canvasDrawn=false confirms the 'init'-hook noCanvas worked this load (the
+  // expensive canvas never instantiated). =true means it still drew.
+  const canvasDrawn = !!globalThis.canvas?.app;
+  console.log(`[puppet] client trim applied; canvasDrawn=${canvasDrawn} killed: ${killed.join(', ') || 'none'}`);
 };
 
 (async () => {
@@ -227,8 +230,11 @@ const CLIENT_TRIM = async () => {
   });
 
   const page = await browser.newPage();
-  // Foundry requires >= 1366x768; anything smaller logs a resolution warning.
-  await page.setViewport({ width: 1366, height: 768 });
+  // Keep this small. Foundry logs a cosmetic "requires >= 1366x768" warning
+  // below that, but a smaller viewport means fewer pixels to software-raster
+  // during the unavoidable first-load canvas draw (before the trim can disable
+  // it) — which matters a lot with no GPU. Performance wins over the warning.
+  await page.setViewport({ width: 1280, height: 720 });
 
   // Run before any document scripts on every navigation:
   //   1. Silence console.debug so Foundry's per-hook chatter never reaches CDP.
@@ -247,6 +253,24 @@ const CLIENT_TRIM = async () => {
     try {
       window.requestAnimationFrame = () => 0;
       window.cancelAnimationFrame = () => { };
+    } catch { }
+
+    //   4. Force noCanvas on Foundry's 'init' hook — BEFORE the canvas is drawn.
+    //      noCanvas is a client-scope setting living in this profile's
+    //      localStorage; a fresh profile dir (e.g. after the instance was
+    //      renamed) defaults it off, so the canvas draws and — on a GPU-less
+    //      host — pegs the CPU hard enough to stall game.ready before the
+    //      post-ready trim can disable it. Setting it at 'init' applies on the
+    //      CURRENT load and breaks that deadlock. Poll for Hooks since it
+    //      doesn't exist yet when this runs.
+    try {
+      const t = setInterval(() => {
+        if (!globalThis.Hooks) return;
+        clearInterval(t);
+        Hooks.once('init', () => {
+          try { game.settings.set('core', 'noCanvas', true); } catch { }
+        });
+      }, 50);
     } catch { }
   });
 
