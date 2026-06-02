@@ -354,9 +354,12 @@ const CLIENT_TRIM = async () => {
 
     // Race the login form against game-ready: if the session cookie is still valid
     // Foundry loads the game directly, otherwise we see the form and fill it.
+    // polling: 2000 — NOT the default 'raf' polling, which is dead here because
+    // we no-op requestAnimationFrame (see the game-ready wait below for the full
+    // explanation). Interval polling works regardless.
     const outcome = await Promise.race([
       page.waitForSelector('select[name="userid"]', { timeout: FORM_RACE_TIMEOUT }).then(() => 'form').catch(() => null),
-      page.waitForFunction(() => globalThis.game?.ready === true, { timeout: FORM_RACE_TIMEOUT }).then(() => 'game').catch(() => null),
+      page.waitForFunction(() => globalThis.game?.ready === true, { polling: 2000, timeout: FORM_RACE_TIMEOUT }).then(() => 'game').catch(() => null),
     ]);
 
     if (outcome === 'form') {
@@ -378,35 +381,29 @@ const CLIENT_TRIM = async () => {
 
     // Confirm the game actually finished loading, not just the HTML.
     // Heavily-modded worlds on busy servers can easily take 2+ minutes.
-    // On timeout, dump the actual game state so we know WHY ready never came
-    // (game undefined? socket down? stuck mid-init?) instead of a bare
-    // "Waiting failed". Also log progress periodically while we wait.
-    let waited = 0;
-    const PROGRESS_EVERY = 30000;
-    const progress = setInterval(async () => {
-      waited += PROGRESS_EVERY;
-      const st = await page.evaluate(() => ({
+    //
+    // IMPORTANT: poll with page.evaluate, NOT page.waitForFunction. Puppeteer's
+    // waitForFunction polls via requestAnimationFrame by default, and we no-op
+    // rAF (for CPU) in evaluateOnNewDocument — so its poller never re-fires and
+    // it hangs forever even after game.ready turns true. page.evaluate is a
+    // one-shot call each tick, immune to the rAF kill. On timeout we already
+    // have the last observed state to explain why.
+    const deadline = Date.now() + GAME_READY_TIMEOUT;
+    let ready = false;
+    let st = null;
+    for (let waited = 0; Date.now() < deadline; waited += 2000) {
+      st = await page.evaluate(() => ({
+        ready: globalThis.game?.ready === true,
         game: typeof globalThis.game,
-        ready: globalThis.game?.ready,
         socket: globalThis.game?.socket?.connected,
         scene: globalThis.game?.scenes?.active?.name ?? null,
       })).catch(e => ({ evalError: e.message }));
-      console.log(`[join-wait] +${waited / 1000}s ${JSON.stringify(st)}`);
-    }, PROGRESS_EVERY);
-    try {
-      await page.waitForFunction(() => globalThis.game?.ready === true, { timeout: GAME_READY_TIMEOUT });
-    } catch (e) {
-      const st = await page.evaluate(() => ({
-        game: typeof globalThis.game,
-        ready: globalThis.game?.ready,
-        socket: globalThis.game?.socket?.connected,
-        scene: globalThis.game?.scenes?.active?.name ?? null,
-        url: location.href,
-      })).catch(ev => ({ evalError: ev.message }));
-      throw new Error(`game-ready wait failed: ${e.message} | state=${JSON.stringify(st)}`);
-    } finally {
-      clearInterval(progress);
+      if (st.ready) { ready = true; break; }
+      if (waited && waited % 30000 === 0) console.log(`[join-wait] +${waited / 1000}s ${JSON.stringify(st)}`);
+      await new Promise(r => setTimeout(r, 2000));
     }
+    if (!ready) throw new Error(`game-ready timeout | state=${JSON.stringify(st)}`);
+
     gameMissingCount = 0;
     lastReadyAt = Date.now();
     console.log(`[join] ready at ${page.url()}`);
