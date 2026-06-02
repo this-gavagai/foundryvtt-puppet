@@ -179,6 +179,20 @@ const CLIENT_TRIM = async () => {
   // Notify any module listening for visibilitychange so it can pause itself.
   try { document.dispatchEvent(new Event('visibilitychange')); } catch { }
 
+  // Diagnostic: surface WHY Foundry's socket drops. socket.io reasons are
+  // semantic — 'io server disconnect' = the server kicked us (e.g. it
+  // restarted/crashed), 'ping timeout'/'transport close'/'transport error' =
+  // network/transport. Guard so we only attach once per socket instance.
+  try {
+    const sock = game.socket;
+    if (sock && !sock.__puppetInstrumented) {
+      sock.__puppetInstrumented = true;
+      sock.on('disconnect', (reason) => console.log(`[socket] disconnect: ${reason}`));
+      sock.io?.on?.('reconnect_attempt', (n) => console.log(`[socket] reconnect_attempt ${n}`));
+      sock.io?.on?.('reconnect_error', (e) => console.log(`[socket] reconnect_error: ${e?.message || e}`));
+    }
+  } catch { }
+
   console.log(`[puppet] client trim applied; killed: ${killed.join(', ') || 'none'}`);
 };
 
@@ -280,10 +294,39 @@ const CLIENT_TRIM = async () => {
     };
     installNoAnim();
     try { document.addEventListener('DOMContentLoaded', installNoAnim); } catch { }
+
+    // Diagnostic: log every WebSocket close with its code/reason. The close
+    // code distinguishes WHY the connection dropped — 1000 normal, 1001 going
+    // away, 1006 abnormal (no close frame: server crash / severed link), 1012
+    // service restart. Foundry's socket.io runs over this WebSocket, so this
+    // reveals what's behind the reconnect churn. Wrap the constructor while
+    // preserving prototype + static constants so socket.io keeps working.
+    try {
+      const OrigWS = window.WebSocket;
+      if (OrigWS && !OrigWS.__puppetWrapped) {
+        const WrappedWS = function (url, protocols) {
+          const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+          try {
+            ws.addEventListener('close', (e) => {
+              console.log(`[ws-close] code=${e.code} clean=${e.wasClean}${e.reason ? ` reason="${e.reason}"` : ''}`);
+            });
+          } catch { }
+          return ws;
+        };
+        WrappedWS.prototype = OrigWS.prototype;
+        WrappedWS.CONNECTING = OrigWS.CONNECTING;
+        WrappedWS.OPEN = OrigWS.OPEN;
+        WrappedWS.CLOSING = OrigWS.CLOSING;
+        WrappedWS.CLOSED = OrigWS.CLOSED;
+        WrappedWS.__puppetWrapped = true;
+        window.WebSocket = WrappedWS;
+      }
+    } catch { }
   });
 
   let reconnecting = false;
   let lastReconnectEndedAt = 0;
+  let lastReadyAt = 0;
   let gameMissingCount = 0;
   let initialJoinDone = false;
 
@@ -332,6 +375,7 @@ const CLIENT_TRIM = async () => {
     // Heavily-modded worlds on busy servers can easily take 2+ minutes.
     await page.waitForFunction(() => globalThis.game?.ready === true, { timeout: GAME_READY_TIMEOUT });
     gameMissingCount = 0;
+    lastReadyAt = Date.now();
     console.log(`[join] ready at ${page.url()}`);
 
     await page.evaluate(CLIENT_TRIM).catch(e => console.log(`[puppet] trim block error: ${e.message}`));
@@ -342,7 +386,8 @@ const CLIENT_TRIM = async () => {
     // Ignore stale events fired just after a successful reconnect
     if (Date.now() - lastReconnectEndedAt < RECONNECT_STALE_GUARD) return;
     reconnecting = true;
-    console.log(`[reconnect] triggered: ${reason}`);
+    const lasted = lastReadyAt ? ` (session lasted ${Math.round((Date.now() - lastReadyAt) / 1000)}s)` : '';
+    console.log(`[reconnect] triggered: ${reason}${lasted}`);
     for (let attempt = 1; ; attempt++) {
       if (page.isClosed()) {
         exitWithReason(1, 'page closed during reconnect');
