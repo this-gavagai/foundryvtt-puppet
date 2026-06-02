@@ -53,9 +53,11 @@ process.on('unhandledRejection', err => {
 
 // Runs in the page (via page.evaluate) once the game is ready. Strips every
 // client-side component a headless GM bot doesn't need. These are client-scope
-// settings, persisted server-side per user in v13+ (NOT localStorage), so
-// noCanvas only takes effect on the *next* load — hence the per-load
-// reapplication. Each step is wrapped so one failure can't tank the whole trim.
+// settings, stored in this Chrome profile's localStorage — so once set they
+// persist across restarts (as long as the profile dir does), but noCanvas only
+// takes effect on the *next* load, which is why a brand-new (cold) profile
+// still draws the canvas once before this trim disables it for subsequent
+// loads. Each step is wrapped so one failure can't tank the whole trim.
 const CLIENT_TRIM = async () => {
   const trySet = async (key, value) => {
     try {
@@ -174,10 +176,7 @@ const CLIENT_TRIM = async () => {
   // Notify any module listening for visibilitychange so it can pause itself.
   try { document.dispatchEvent(new Event('visibilitychange')); } catch { }
 
-  // canvasDrawn=false confirms the 'init'-hook noCanvas worked this load (the
-  // expensive canvas never instantiated). =true means it still drew.
-  const canvasDrawn = !!globalThis.canvas?.app;
-  console.log(`[puppet] client trim applied; canvasDrawn=${canvasDrawn} killed: ${killed.join(', ') || 'none'}`);
+  console.log(`[puppet] client trim applied; killed: ${killed.join(', ') || 'none'}`);
 };
 
 (async () => {
@@ -253,24 +252,6 @@ const CLIENT_TRIM = async () => {
     try {
       window.requestAnimationFrame = () => 0;
       window.cancelAnimationFrame = () => { };
-    } catch { }
-
-    //   4. Force noCanvas on Foundry's 'init' hook — BEFORE the canvas is drawn.
-    //      noCanvas is a client-scope setting living in this profile's
-    //      localStorage; a fresh profile dir (e.g. after the instance was
-    //      renamed) defaults it off, so the canvas draws and — on a GPU-less
-    //      host — pegs the CPU hard enough to stall game.ready before the
-    //      post-ready trim can disable it. Setting it at 'init' applies on the
-    //      CURRENT load and breaks that deadlock. Poll for Hooks since it
-    //      doesn't exist yet when this runs.
-    try {
-      const t = setInterval(() => {
-        if (!globalThis.Hooks) return;
-        clearInterval(t);
-        Hooks.once('init', () => {
-          try { game.settings.set('core', 'noCanvas', true); } catch { }
-        });
-      }, 50);
     } catch { }
   });
 
