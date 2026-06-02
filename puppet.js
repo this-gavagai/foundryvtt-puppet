@@ -6,11 +6,11 @@ const FOUNDRY_USER_ID = process.env.FOUNDRY_USER_ID;
 const FOUNDRY_PASSWORD = process.env.FOUNDRY_PASSWORD;
 const USER_DATA_DIR = process.env.PUPPET_PROFILE_DIR || path.join(__dirname, 'profile');
 
-// Credentials must come from the environment (see ecosystem.config.js /
+// URL + credentials must come from the environment (see ecosystem.config.js /
 // secrets.json) — no baked-in defaults, so a misconfigured deploy fails loudly
-// instead of silently logging in with the wrong account.
-if (!FOUNDRY_USER_ID || !FOUNDRY_PASSWORD) {
-  console.error('[fatal] FOUNDRY_USER_ID and FOUNDRY_PASSWORD environment variables are required');
+// instead of silently logging in wrong or navigating to "undefined/join".
+if (!FOUNDRY_URL || !FOUNDRY_USER_ID || !FOUNDRY_PASSWORD) {
+  console.error('[fatal] FOUNDRY_URL, FOUNDRY_USER_ID and FOUNDRY_PASSWORD environment variables are required');
   process.exit(1);
 }
 
@@ -18,7 +18,10 @@ if (!FOUNDRY_USER_ID || !FOUNDRY_PASSWORD) {
 const NAV_TIMEOUT = 60000;          // page.goto / waitForNavigation
 const FORM_RACE_TIMEOUT = 30000;    // login-form vs game-ready race
 const FORM_FIELD_TIMEOUT = 5000;    // individual login-form fields
-const GAME_READY_TIMEOUT = 240000;  // full world load on a busy, modded server
+const GAME_READY_TIMEOUT = 600000;  // generous — a COLD profile draws the canvas
+                                    // once (slow, software-rendered) before the
+                                    // trim can disable it; give that one load
+                                    // room to finish and persist noCanvas.
 const POLL_INTERVAL = 15000;        // foundry health poll
 const JIGGLE_INTERVAL = 30000;      // mouse-move keepalive
 const MEM_INTERVAL = 60000;         // memory snapshot
@@ -242,6 +245,7 @@ const CLIENT_TRIM = async () => {
   //   3. No-op requestAnimationFrame / cancelAnimationFrame. RAF is the upstream
   //      fanout for every visual loop (PIXI tickers, Three.js setAnimationLoop,
   //      module animations). Killing it here severs all of them at once.
+  //   4. Kill ALL CSS animations/transitions from the first paint — see below.
   await page.evaluateOnNewDocument(() => {
     // eslint-disable-next-line no-console
     console.debug = () => { };
@@ -253,6 +257,29 @@ const CLIENT_TRIM = async () => {
       window.requestAnimationFrame = () => 0;
       window.cancelAnimationFrame = () => { };
     } catch { }
+
+    // CSS animations/transitions run on the compositor thread — NOT via
+    // requestAnimationFrame and NOT on the JS main thread. With no GPU they are
+    // software-rasterized, and Foundry's load-time UI (the loading spinner, the
+    // paused pulse, fa-spin) animates continuously during the whole load. On a
+    // COLD profile that also draws the canvas, this compositor work pegs the
+    // CPU hard enough to starve the main thread so game.ready never arrives —
+    // the load can't finish, the post-ready trim never runs, and noCanvas never
+    // gets persisted, so it can never warm itself up. The trim's kill is too
+    // late; this kills them from the very first paint so a cold first load can
+    // complete and persist noCanvas. Inject into <html> immediately (head may
+    // not exist yet at document-start) and re-assert on DOMContentLoaded.
+    const installNoAnim = () => {
+      try {
+        if (document.getElementById('puppet-no-anim')) return;
+        const style = document.createElement('style');
+        style.id = 'puppet-no-anim';
+        style.textContent = '*,*::before,*::after{animation:none !important;transition:none !important;}';
+        (document.head || document.documentElement).appendChild(style);
+      } catch { }
+    };
+    installNoAnim();
+    try { document.addEventListener('DOMContentLoaded', installNoAnim); } catch { }
   });
 
   let reconnecting = false;
