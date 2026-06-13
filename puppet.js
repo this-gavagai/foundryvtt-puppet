@@ -5,6 +5,7 @@ const FOUNDRY_URL = process.env.FOUNDRY_URL;
 const FOUNDRY_USER_ID = process.env.FOUNDRY_USER_ID;
 const FOUNDRY_PASSWORD = process.env.FOUNDRY_PASSWORD;
 const USER_DATA_DIR = process.env.PUPPET_PROFILE_DIR || path.join(__dirname, 'profile');
+const DISABLE_RTC = process.env.PUPPET_DISABLE_RTC !== '0';
 
 // URL + credentials must come from the environment (see ecosystem.config.js /
 // secrets.json) — no baked-in defaults, so a misconfigured deploy fails loudly
@@ -31,6 +32,31 @@ const ORPHAN_EXIT_GRACE = 500;      // let chrome's 'exit' fire before we exit
 
 // 24h + up to 30min jitter, so multiple instances don't all restart together
 const DAILY_RESTART_MS = 24 * 60 * 60 * 1000 + Math.floor(Math.random() * 30 * 60 * 1000);
+
+const shouldBlockRtcRequest = (url) => {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname.toLowerCase();
+    return host.includes('livekit') ||
+      host.startsWith('stun.') ||
+      host.startsWith('turn.') ||
+      /(^|[.-])rtc([.-]|$)/.test(host) ||
+      path.includes('/livekit') ||
+      /\/(?:rtc|webrtc)(?:\/|$)/.test(path);
+  } catch {
+    return /livekit|webrtc|\/rtc(?:\/|\?|$)/i.test(url);
+  }
+};
+
+const redactUrl = (url) => {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url.split('?')[0];
+  }
+};
 
 // Assigned once the browser launches; exitWithReason() kills it so we never
 // leave an orphaned Chrome holding the userDataDir lock across a pm2 restart.
@@ -257,6 +283,28 @@ const CLIENT_TRIM = async () => {
   // arg above is what actually satisfies it; this keeps innerWidth consistent.)
   await page.setViewport({ width: 1366, height: 768 });
 
+  if (DISABLE_RTC) {
+    try {
+      await browser.defaultBrowserContext().setPermission('*',
+        { permission: { name: 'camera' }, state: 'denied' },
+        { permission: { name: 'microphone' }, state: 'denied' },
+      );
+    } catch (e) {
+      console.log(`[rtc] failed to deny browser media permissions: ${e.message}`);
+    }
+
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      if (req.isInterceptResolutionHandled?.()) return;
+      if (shouldBlockRtcRequest(req.url())) {
+        console.log(`[rtc] blocked ${req.resourceType()} ${redactUrl(req.url())}`);
+        req.abort('blockedbyclient').catch(e => console.log(`[rtc] block failed: ${e.message}`));
+        return;
+      }
+      req.continue().catch(e => console.log(`[request] continue failed: ${e.message}`));
+    });
+  }
+
   // Run before any document scripts on every navigation:
   //   1. Silence console.debug so Foundry's per-hook chatter never reaches CDP.
   //   2. Report the page as hidden so well-behaved modules skip animation work
@@ -265,7 +313,7 @@ const CLIENT_TRIM = async () => {
   //      fanout for every visual loop (PIXI tickers, Three.js setAnimationLoop,
   //      module animations). Killing it here severs all of them at once.
   //   4. Kill ALL CSS animations/transitions from the first paint — see below.
-  await page.evaluateOnNewDocument(() => {
+  await page.evaluateOnNewDocument((disableRtc) => {
     // eslint-disable-next-line no-console
     console.debug = () => { };
     try {
@@ -276,6 +324,64 @@ const CLIENT_TRIM = async () => {
       window.requestAnimationFrame = () => 0;
       window.cancelAnimationFrame = () => { };
     } catch { }
+
+    if (disableRtc) {
+      const makeDeniedError = () => {
+        try {
+          return new DOMException('WebRTC is disabled for this puppet client', 'NotAllowedError');
+        } catch {
+          const e = new Error('WebRTC is disabled for this puppet client');
+          e.name = 'NotAllowedError';
+          return e;
+        }
+      };
+
+      try {
+        const mediaDevices = navigator.mediaDevices || {};
+        mediaDevices.getUserMedia = async () => { throw makeDeniedError(); };
+        mediaDevices.getDisplayMedia = async () => { throw makeDeniedError(); };
+        mediaDevices.enumerateDevices = async () => [];
+        Object.defineProperty(navigator, 'mediaDevices', {
+          configurable: true,
+          get: () => mediaDevices,
+        });
+      } catch { }
+
+      try {
+        const OriginalQuery = navigator.permissions?.query?.bind(navigator.permissions);
+        if (OriginalQuery) {
+          navigator.permissions.query = (descriptor) => {
+            if (['camera', 'microphone'].includes(descriptor?.name)) {
+              return Promise.resolve({
+                state: 'denied',
+                onchange: null,
+                addEventListener: () => { },
+                removeEventListener: () => { },
+                dispatchEvent: () => false,
+              });
+            }
+            return OriginalQuery(descriptor);
+          };
+        }
+      } catch { }
+
+      try {
+        const DisabledRTCPeerConnection = function () {
+          throw makeDeniedError();
+        };
+        DisabledRTCPeerConnection.generateCertificate = async () => { throw makeDeniedError(); };
+        Object.defineProperty(window, 'RTCPeerConnection', {
+          configurable: true,
+          writable: true,
+          value: DisabledRTCPeerConnection,
+        });
+        Object.defineProperty(window, 'webkitRTCPeerConnection', {
+          configurable: true,
+          writable: true,
+          value: DisabledRTCPeerConnection,
+        });
+      } catch { }
+    }
 
     // CSS animations/transitions run on the compositor thread — NOT via
     // requestAnimationFrame and NOT on the JS main thread. With no GPU they are
@@ -327,7 +433,7 @@ const CLIENT_TRIM = async () => {
         window.WebSocket = WrappedWS;
       }
     } catch { }
-  });
+  }, DISABLE_RTC);
 
   let reconnecting = false;
   let lastReconnectEndedAt = 0;
