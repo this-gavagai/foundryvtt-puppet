@@ -2,6 +2,10 @@ const path = require('path');
 const puppeteer = require('puppeteer');
 
 const FOUNDRY_URL = process.env.FOUNDRY_URL;
+// Foundry v14.367 replaced the user-id <select> on /join with a free-text
+// username field, so the login identity is now the user's *display name*.
+// FOUNDRY_USER_ID is still read to support servers on the older form.
+const FOUNDRY_USER_NAME = process.env.FOUNDRY_USER_NAME;
 const FOUNDRY_USER_ID = process.env.FOUNDRY_USER_ID;
 const FOUNDRY_PASSWORD = process.env.FOUNDRY_PASSWORD;
 const USER_DATA_DIR = process.env.PUPPET_PROFILE_DIR || path.join(__dirname, 'profile');
@@ -10,9 +14,12 @@ const DISABLE_RTC = process.env.PUPPET_DISABLE_RTC !== '0';
 // URL + credentials must come from the environment (see ecosystem.config.js /
 // secrets.json) — no baked-in defaults, so a misconfigured deploy fails loudly
 // instead of silently logging in wrong or navigating to "undefined/join".
-if (!FOUNDRY_URL || !FOUNDRY_USER_ID || !FOUNDRY_PASSWORD) {
-  console.error('[fatal] FOUNDRY_URL, FOUNDRY_USER_ID and FOUNDRY_PASSWORD environment variables are required');
+if (!FOUNDRY_URL || !FOUNDRY_PASSWORD || (!FOUNDRY_USER_NAME && !FOUNDRY_USER_ID)) {
+  console.error('[fatal] FOUNDRY_URL, FOUNDRY_PASSWORD and FOUNDRY_USER_NAME (or legacy FOUNDRY_USER_ID) environment variables are required');
   process.exit(1);
+}
+if (!FOUNDRY_USER_NAME) {
+  console.warn('[config] FOUNDRY_USER_NAME is not set — only pre-v14.367 servers (user-id <select> form) can be joined');
 }
 
 // --- Tunables (all milliseconds) -------------------------------------------
@@ -47,6 +54,69 @@ const shouldBlockRtcRequest = (url) => {
   } catch {
     return /livekit|webrtc|\/rtc(?:\/|\?|$)/i.test(url);
   }
+};
+
+// --- Login form -------------------------------------------------------------
+// Foundry v14.367 reshaped /join: the user picker went from a <select> of user
+// ids to a free-text field taking the user's display *name*. Both shapes are
+// handled so the bot doesn't have to be redeployed in lockstep with a server
+// upgrade (and keeps working if a server is rolled back).
+const USER_FIELD_SELECTOR = 'input[name="username"], select[name="userid"]';
+const LOGIN_ERROR_SELECTOR = '#notifications li.notification.error';
+
+// Persistent profiles mean Chrome may have autofilled a field; clear it before
+// typing so we don't append to a prefilled value.
+const typeFresh = async (page, selector, value) => {
+  await page.$eval(selector, (el) => { el.value = ''; });
+  await page.type(selector, value);
+};
+
+const fillLoginForm = async (page) => {
+  await page.waitForSelector('input[name="password"]', { timeout: FORM_FIELD_TIMEOUT });
+  await page.waitForSelector('button[name="join"]', { timeout: FORM_FIELD_TIMEOUT });
+
+  if (await page.$('input[name="username"]')) {
+    if (!FOUNDRY_USER_NAME) {
+      throw new Error('server serves the v14.367+ username form but FOUNDRY_USER_NAME is not set');
+    }
+    await typeFresh(page, 'input[name="username"]', FOUNDRY_USER_NAME);
+    console.log(`[login] username form — joining as "${FOUNDRY_USER_NAME}"`);
+  } else {
+    if (!FOUNDRY_USER_ID) {
+      throw new Error('server serves the legacy user-id form but FOUNDRY_USER_ID is not set');
+    }
+    await page.select('select[name="userid"]', FOUNDRY_USER_ID);
+    console.log(`[login] legacy user-id form — joining as ${FOUNDRY_USER_ID}`);
+  }
+
+  await typeFresh(page, 'input[name="password"]', FOUNDRY_PASSWORD);
+};
+
+// Submit the form, then race the navigation against an error toast. Foundry
+// rejects a bad credential by re-rendering /join with a toast and NO navigation,
+// so without this the failure is indistinguishable from a slow load: we would
+// wait out NAV_TIMEOUT and then GAME_READY_TIMEOUT before reporting a useless
+// "game-ready timeout" instead of the server's actual complaint.
+//
+// Both watchers are armed before the click so neither event can be missed.
+// waitForSelector is MutationObserver-based, so it is unaffected by our rAF
+// no-op (unlike waitForFunction — see the game-ready poll).
+const submitLoginForm = async (page) => {
+  const errorSeen = page
+    .waitForSelector(LOGIN_ERROR_SELECTOR, { timeout: NAV_TIMEOUT })
+    .then(h => h.evaluate(n => n.textContent.trim()))
+    .catch(() => null);
+  const navigated = page
+    .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+    .then(() => null)
+    .catch(() => null);
+
+  await page.click('button[name="join"]');
+
+  // Whichever settles first decides: a toast means rejection, a navigation (or
+  // either watcher timing out) means we hand off to the game-ready poll.
+  const error = await Promise.race([errorSeen, navigated]);
+  if (error) throw new Error(`login rejected: ${error}`);
 };
 
 const redactUrl = (url) => {
@@ -460,11 +530,13 @@ const CLIENT_TRIM = async () => {
 
     // Race the login form against game-ready: if the session cookie is still valid
     // Foundry loads the game directly, otherwise we see the form and fill it.
+    // Match either form shape — v14.367+ serves input[name=username], older
+    // builds serve select[name=userid] (see fillLoginForm).
     // polling: 2000 — NOT the default 'raf' polling, which is dead here because
     // we no-op requestAnimationFrame (see the game-ready wait below for the full
     // explanation). Interval polling works regardless.
     const outcome = await Promise.race([
-      page.waitForSelector('select[name="userid"]', { timeout: FORM_RACE_TIMEOUT }).then(() => 'form').catch(() => null),
+      page.waitForSelector(USER_FIELD_SELECTOR, { timeout: FORM_RACE_TIMEOUT }).then(() => 'form').catch(() => null),
       page.waitForFunction(() => globalThis.game?.ready === true, { polling: 2000, timeout: FORM_RACE_TIMEOUT }).then(() => 'game').catch(() => null),
     ]);
 
@@ -473,14 +545,8 @@ const CLIENT_TRIM = async () => {
       // This is the clearest signal that the server actively ended our session
       // rather than a network/socket drop.
       console.log('[load] login form shown — session was not preserved, re-authenticating');
-      await page.waitForSelector('input[name="password"]', { timeout: FORM_FIELD_TIMEOUT });
-      await page.waitForSelector('button[name="join"]', { timeout: FORM_FIELD_TIMEOUT });
-      await page.select('select[name="userid"]', FOUNDRY_USER_ID);
-      await page.type('input[name="password"]', FOUNDRY_PASSWORD);
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => { }),
-        page.click('button[name="join"]'),
-      ]);
+      await fillLoginForm(page);
+      await submitLoginForm(page);
     } else if (outcome === 'game') {
       console.log('[load] session cookie still valid — skipped login form');
     }

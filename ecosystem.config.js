@@ -2,7 +2,10 @@ const path = require('path');
 
 // All per-deployment config lives in secrets.json (gitignored), keyed by
 // instance name, shaped as:
-//   { "boom": { "url": "http://...", "userId": "...", "password": "..." }, ... }
+//   { "boom": { "url": "http://...", "userName": "...", "password": "..." }, ... }
+// userName is the Foundry user's display name — since v14.367 the /join form
+// takes the name, not the document id. `userId` is still accepted for servers
+// on the older user-id <select> form.
 // Each gets its own Chrome profile dir (derived from the name), so instances
 // never collide on the userDataDir lock. Copy secrets.example.json ->
 // secrets.json and fill it in on each host.
@@ -15,8 +18,8 @@ try {
 
 module.exports = {
   apps: Object.entries(secrets).map(([name, cfg]) => {
-    if (!cfg.url || !cfg.userId || !cfg.password) {
-      throw new Error(`[ecosystem] instance "${name}" needs url, userId, and password in secrets.json`);
+    if (!cfg.url || !cfg.password || (!cfg.userName && !cfg.userId)) {
+      throw new Error(`[ecosystem] instance "${name}" needs url, password, and userName (or legacy userId) in secrets.json`);
     }
     return {
       name: `puppet-${name}`,
@@ -29,7 +32,9 @@ module.exports = {
       time: true,               // prefix log lines with timestamps
       env: {
         FOUNDRY_URL: cfg.url,
-        FOUNDRY_USER_ID: cfg.userId,
+        // Omit when absent — pm2 would otherwise pass the literal "undefined".
+        ...(cfg.userName ? { FOUNDRY_USER_NAME: cfg.userName } : {}),
+        ...(cfg.userId ? { FOUNDRY_USER_ID: cfg.userId } : {}),
         FOUNDRY_PASSWORD: cfg.password,
         PUPPET_PROFILE_DIR: path.join(__dirname, 'profiles', name),
       },
